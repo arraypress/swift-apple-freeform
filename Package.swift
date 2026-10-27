@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "swift-apple-freeform",
-    // SQLite3 is in the OS; nothing is vendored and nothing is fetched. macOS
+    // SQLite is read through swift-sqlite-reader; nothing is vendored. macOS
     // only — Freeform's store on a Mac is the one this reads.
     platforms: [
         .macOS(.v14)
@@ -11,8 +11,13 @@ let package = Package(
     products: [
         .library(name: "AppleFreeform", targets: ["AppleFreeform"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/arraypress/swift-sqlite-reader.git", from: "0.1.0"),
+    ],
     targets: [
-        .target(name: "AppleFreeform"),
+        .target(name: "AppleFreeform", dependencies: [
+            .product(name: "SQLiteReader", package: "swift-sqlite-reader"),
+        ]),
         .testTarget(name: "AppleFreeformTests", dependencies: ["AppleFreeform"]),
     ]
 )

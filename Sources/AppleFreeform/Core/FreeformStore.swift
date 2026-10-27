@@ -6,7 +6,8 @@
 //
 //  Freeform's boards and what is written on them, read from its store — not
 //  by driving the app. The store is a SQLite file in the
-//  `group.com.apple.freeform` container, opened read-only; it is not
+//  `group.com.apple.freeform` container, opened read-only through
+//  swift-sqlite-reader; it is not
 //  encrypted on the Mac, but the container is protected: the app running
 //  this needs Full Disk Access. Each item is a sync record (RecordStrings);
 //  pictures and files sit under `Assets/`, found through `asset_references`.
@@ -14,7 +15,7 @@
 //
 
 import Foundation
-import SQLite3
+import SQLiteReader
 
 /// Freeform's boards and items, read-only.
 ///
@@ -31,7 +32,7 @@ public final class FreeformStore {
             .appendingPathComponent("Library/Group Containers/group.com.apple.freeform/Boards/boards.db")
     }
 
-    private let handle: OpaquePointer
+    private let store: SQLiteReader
     private let assets: URL
 
     /// Opens the store, read-only.
@@ -40,39 +41,24 @@ public final class FreeformStore {
     /// - Throws: ``AppleFreeformError/storeNotFound(_:)``, ``AppleFreeformError/permissionDenied(_:)``
     ///   or ``AppleFreeformError/databaseError(_:)``.
     public init(url: URL = FreeformStore.defaultLocation) throws {
-        guard FileManager.default.fileExists(atPath: url.path) else { throw AppleFreeformError.storeNotFound(url) }
-        guard FileManager.default.isReadableFile(atPath: url.path) else { throw AppleFreeformError.permissionDenied(url) }
-        var opened: OpaquePointer?
-        guard sqlite3_open_v2("file:\(url.path)?mode=ro", &opened, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
-              let opened else {
-            let message = opened.map { String(cString: sqlite3_errmsg($0)) } ?? "could not open"
-            sqlite3_close(opened)
-            throw message.lowercased().contains("authoriz") || message.lowercased().contains("permission")
-                ? AppleFreeformError.permissionDenied(url) : AppleFreeformError.databaseError(message)
-        }
-        handle = opened
+        do { store = try SQLiteReader(path: url, opening: .readOnly) } catch { throw AppleFreeformError(error, store: url) }
         assets = url.deletingLastPathComponent().appendingPathComponent("Assets")
-        guard !SQLiteRows.rows(handle, "SELECT count(*) FROM boards;").isEmpty else {
-            sqlite3_close(handle)
-            throw AppleFreeformError.permissionDenied(url)
-        }
+        guard !fetch("SELECT count(*) FROM boards;").isEmpty else { throw AppleFreeformError.permissionDenied(url) }
     }
-
-    deinit { sqlite3_close(handle) }
 
     /// Every board, most recently worked on first.
     ///
     /// - Parameter includeDeleted: Include Recently Deleted.
     public func boards(includeDeleted: Bool = false) -> [Board] {
-        let counts = Dictionary(SQLiteRows.rows(handle, "SELECT hex(board_identifier), count(*) FROM board_items WHERE COALESCE(tombstoned, 0) = 0 GROUP BY board_identifier;")
-            .compactMap { row -> (String, Int)? in (row[0] as? String).map { ($0, Int(row[1] as? Int64 ?? 0)) } }, uniquingKeysWith: +)
-        return SQLiteRows.rows(handle, "SELECT hex(board_identifier), data, last_activity_time, tombstoned FROM boards ORDER BY last_activity_time DESC;")
+        let counts = Dictionary(fetch("SELECT hex(board_identifier), count(*) FROM board_items WHERE COALESCE(tombstoned, 0) = 0 GROUP BY board_identifier;")
+            .compactMap { row -> (String, Int)? in row[0].string.map { ($0, row[1].int ?? 0) } }, uniquingKeysWith: +)
+        return fetch("SELECT hex(board_identifier), data, last_activity_time, tombstoned FROM boards ORDER BY last_activity_time DESC;")
             .compactMap { row -> Board? in
-                guard let hex = row[0] as? String else { return nil }
-                let deleted = (row[3] as? Int64 ?? 0) != 0
+                guard let hex = row[0].string else { return nil }
+                let deleted = row[3].bool ?? false
                 guard includeDeleted || !deleted else { return nil }
-                return Board(id: FreeformIDs.uuid(hex) ?? hex, name: RecordStrings.words(row[1] as? Data).first ?? "Untitled",
-                             lastActivity: SQLiteRows.date(row[2]), itemCount: counts[hex] ?? 0, isDeleted: deleted)
+                return Board(id: FreeformIDs.uuid(hex) ?? hex, name: RecordStrings.words(row[1].data).first ?? "Untitled",
+                             lastActivity: Self.date(row[2]), itemCount: counts[hex] ?? 0, isDeleted: deleted)
             }
     }
 
@@ -90,14 +76,14 @@ public final class FreeformStore {
     public func items(board: String? = nil) -> [BoardItem] {
         let files = assetFiles()
         let clause = board.flatMap(FreeformIDs.hex).map { "AND hex(board_identifier) = '\($0)'" } ?? ""
-        return SQLiteRows.rows(handle, """
+        return fetch("""
             SELECT hex(item_uuid), hex(board_identifier), item_type, sub_item_type, specific_data, capsule_data FROM board_items
             WHERE COALESCE(tombstoned, 0) = 0 \(clause) ORDER BY rowid;
             """).compactMap { row -> BoardItem? in
-            guard let item = row[0] as? String, let boardHex = row[1] as? String else { return nil }
-            let type = Int(row[2] as? Int64 ?? -1)
-            let kind = ItemKinds.kind(type: type, subtype: (row[3] as? Int64).map(Int.init))
-            let words = (RecordStrings.words(row[4] as? Data) + RecordStrings.words(row[5] as? Data)).filter { !ItemKinds.isAssetName($0) }
+            guard let item = row[0].string, let boardHex = row[1].string else { return nil }
+            let type = row[2].int ?? -1
+            let kind = ItemKinds.kind(type: type, subtype: row[3].int)
+            let words = (RecordStrings.words(row[4].data) + RecordStrings.words(row[5].data)).filter { !ItemKinds.isAssetName($0) }
             let url = kind == .link ? ItemKinds.url(in: words) : nil
             return BoardItem(id: FreeformIDs.uuid(item) ?? item, board: FreeformIDs.uuid(boardHex) ?? boardHex, kind: kind, type: type,
                              text: words.filter { $0 != url }, url: url, file: files[item])
@@ -120,16 +106,27 @@ public final class FreeformStore {
     /// else any asset that is not a thumbnail or link preview.
     private func assetFiles() -> [String: URL] {
         var found: [String: URL] = [:]
-        for row in SQLiteRows.rows(handle, """
+        for row in fetch("""
             SELECT hex(r.referrer_identifier), r.referrer_asset_name, hex(a.asset_uuid), a.extension FROM asset_references r
             JOIN assets a ON a.asset_uuid = r.asset_uuid WHERE COALESCE(a.tombstone_date, 0) = 0 ORDER BY r.referrer_asset_name = 'image' DESC;
             """) {
-            guard let item = row[0] as? String, let name = row[1] as? String, let hex = row[2] as? String,
+            guard let item = row[0].string, let name = row[1].string, let hex = row[2].string,
                   name != "thumbnail", name != "linkMetadata", found[item] == nil, let uuid = FreeformIDs.uuid(hex) else { continue }
-            let ext = (row[3] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let ext = row[3].string.flatMap { $0.isEmpty ? nil : $0 }
             let file = assets.appendingPathComponent(ext.map { "\(uuid).\($0)" } ?? uuid)
             if FileManager.default.fileExists(atPath: file.path) { found[item] = file }
         }
         return found
+    }
+
+    /// Every row `sql` returns; none when it cannot run — the queries here are fixed text.
+    private func fetch(_ sql: String) -> [SQLiteRow] {
+        (try? store.rows(sql)) ?? []
+    }
+
+    /// A Core Data-style date column: seconds since 2001, any value (this
+    /// library's own rule, not `appleDate`, which reads 0 as "never").
+    private static func date(_ value: SQLiteValue) -> Date? {
+        value.double.map(Date.init(timeIntervalSinceReferenceDate:))
     }
 }
